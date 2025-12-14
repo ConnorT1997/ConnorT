@@ -205,3 +205,30 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ----------------------------
+# Portfolio repo additions
+# ----------------------------
+
+# Keep the safe template file tracked
+!.env.example
+
+# OS clutter
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editors/IDEs
+.vscode/
+.idea/
+*.code-workspace
+
+# Local data + generated outputs (commit only small samples in data/sample/)
+data/raw/
+data/processed/
+outputs/
+reports/
+*.log
+
+# Power BI (optional: remove this if you want to commit PBIX files)
+*.pbix
