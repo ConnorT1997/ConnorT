@@ -1,6 +1,6 @@
 # Investment & Analytics Portfolio
 
-This repository curates selected projects in investment research, portfolio analytics, and applied data science. The emphasis is on reproducible workflows, clear documentation, and decision-oriented outputs (tables, charts, dashboards, and short research notes).
+This repository curates selected projects in investment research, portfolio analytics, and applied data science. The emphasis is on reproducible workflows, clear documentation, and decision-oriented outputs (tables, charts, and concise research notes).
 
 ## Contents
 - [Featured Projects](#featured-projects)
@@ -29,18 +29,6 @@ This repository curates selected projects in investment research, portfolio anal
 **Location:** `projects/02-portfolio-analytics/`  
 **Status:** TODO — add sample data + notebook walk-through.
 
-### 3) Data Cleaning + EDA Notebooks
-**Goal:** Standardize and document repeatable data-cleaning workflows (schema alignment, missingness audit, parsing/casting, category splits).  
-**Tools:** Python (pandas), notebooks, data dictionary templates.  
-**Location:** `projects/03-data-cleaning-notebooks/`  
-**Status:** TODO — add cleaned outputs + before/after examples.
-
-### 4) Dashboards (Power BI / Tableau)
-**Goal:** Present decision-ready visuals with concise metric definitions and interpretation notes.  
-**Tools:** Power BI/Tableau (screenshots + documentation).  
-**Location:** `projects/04-dashboards/`  
-**Status:** TODO — add screenshots + measure definitions.
-
 ---
 
 ## Project Index
@@ -49,8 +37,6 @@ This repository curates selected projects in investment research, portfolio anal
 |---|---|---:|---|
 | Investment News Email Bot | automation, text, workflows | Python | `projects/01-investment-news-email-bot/` |
 | Portfolio Analytics Toolkit | portfolio, risk, performance | Python | `projects/02-portfolio-analytics/` |
-| Data Cleaning + EDA | cleaning, EDA, schema | Python | `projects/03-data-cleaning-notebooks/` |
-| Dashboards | visualization, reporting | Power BI/Tableau | `projects/04-dashboards/` |
 | Research Notes | memos, writing, methodology | Markdown/PDF | `projects/05-research-notes/` |
 
 ---
@@ -62,7 +48,6 @@ assets/                         # repo-level images (profile, screenshots, diagr
 projects/                       # each project is self-contained with its own README
 templates/                      # README/report/data-dictionary templates
 docs/                           # portfolio and reproducibility notes
-
 ## Contact
 Author: Connor Thomaston, M.S.  
 Website: connorthomaston.com  
