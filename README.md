@@ -48,11 +48,3 @@ assets/                         # repo-level images (profile, screenshots, diagr
 projects/                       # each project is self-contained with its own README
 templates/                      # README/report/data-dictionary templates
 docs/                           # portfolio and reproducibility notes
-
----
-
-## Contact
-Author: Connor Thomaston, M.S.  
-Website: connorthomaston.com  
-LinkedIn: www.linkedin.com/in/connorthomaston  
-Email: connect@connorthomaston.com
