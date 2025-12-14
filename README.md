@@ -43,7 +43,8 @@ This repository curates selected projects in investment research, portfolio anal
 
 ## Contact
 Author: Connor Thomaston, M.S.  
-Website: https://www.connorthomaston.com 
+Website: https://www.connorthomaston.com
+
 LinkedIn: www.linkedin.com/in/connorthomaston  
 Email: connect@connorthomaston.com
 
