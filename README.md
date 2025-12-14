@@ -41,6 +41,14 @@ This repository curates selected projects in investment research, portfolio anal
 
 ---
 
+## Contact
+Author: Connor Thomaston, M.S.  
+Website: connorthomaston.com  
+LinkedIn: www.linkedin.com/in/connorthomaston  
+Email: connect@connorthomaston.com
+
+---
+
 ## Repository Structure
 
 ```text
@@ -48,3 +56,4 @@ assets/                         # repo-level images (profile, screenshots, diagr
 projects/                       # each project is self-contained with its own README
 templates/                      # README/report/data-dictionary templates
 docs/                           # portfolio and reproducibility notes
+
