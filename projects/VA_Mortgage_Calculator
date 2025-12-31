@@ -1,0 +1,667 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[ ]:
+
+
+#!/usr/bin/env python3
+"""
+va_mortgage_calculator.py (terminal-first, Jupyter-compatible)
+
+Modes:
+- (default) interactive menu calculator
+- init: create config.json template you can edit
+- grid: write purchase sensitivity CSV (optionally includes DTI/housing ratio)
+- purchase / affordability / refinance: one-off CLI calculations
+
+Key feature:
+- Inputs are editable via config.json (true calculator behavior).
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import os
+from itertools import product
+from typing import Dict, List, Optional, Tuple
+
+
+# ---------------------------
+# Defaults (merged with config.json if present)
+# ---------------------------
+DEFAULT_CONFIG: Dict[str, object] = {
+    "gross_income_annual": 110000.0,
+    "default_rate": 0.0588,  # default starting point; override with your lender quote
+    "term_years": 30,
+
+    # Nebraska placeholder—replace with your county/assessor effective rate if known
+    "property_tax_rate_annual": 0.0143,
+    "homeowners_insurance_annual": 1600.0,
+    "hoa_monthly": 0.0,
+
+    # Affordability thresholds (editable)
+    "max_housing_ratio": 0.28,  # PITI / gross monthly income
+    "max_dti_ratio": 0.36,      # (PITI + other debts) / gross monthly income
+
+    # VA settings
+    "va": {
+        "enabled": True,
+        "veteran_type": "active",        # active | guard_reserve | exempt
+        "first_use": True,               # True => first-time use; False => subsequent
+        "funding_fee_override": None,    # set to e.g. 0.0215 to force a rate; otherwise table-based
+        "finance_funding_fee": True      # True => fee added to loan; False => paid upfront
+    },
+
+    # Debts for DTI: use either monthly_payment OR (balance + apr_percent + remaining_years)
+    "debts": [
+        # Examples—edit to match your actual situation:
+        {"name": "Personal loan", "balance": 15000, "apr_percent": 10.0, "remaining_years": 3},
+        {"name": "Car loan", "balance": 15000, "apr_percent": 6.5, "remaining_years": 5},
+        # {"name": "Credit card", "monthly_payment": 250}
+    ],
+
+    # Default sensitivity grid points (editable)
+    "grid_defaults": {
+        "prices": [250000, 300000, 350000, 400000],
+        "rates": [0.055, 0.0588, 0.062],
+        "down_pcts": [0.0],  # for VA, typically 0%
+        "out": "grid.csv"
+    }
+}
+
+CONFIG_FILE_DEFAULT = "config.json"
+
+
+# ---------------------------
+# VA funding fee table (override allowed)
+# ---------------------------
+VA_FUNDING_FEE_TABLE = {
+    "active": {
+        "first_use": {"none": 0.0215, "5_10": 0.0150, "10_plus": 0.0125},
+        "subsequent_use": {"none": 0.0330, "5_10": 0.0150, "10_plus": 0.0125},
+    },
+    "guard_reserve": {
+        "first_use": {"none": 0.0240, "5_10": 0.0175, "10_plus": 0.0150},
+        "subsequent_use": {"none": 0.0330, "5_10": 0.0175, "10_plus": 0.0150},
+    },
+    "exempt": {
+        "first_use": {"none": 0.0, "5_10": 0.0, "10_plus": 0.0},
+        "subsequent_use": {"none": 0.0, "5_10": 0.0, "10_plus": 0.0},
+    },
+}
+
+
+# ---------------------------
+# Helpers
+# ---------------------------
+def money(x: float) -> str:
+    if x is None or (isinstance(x, float) and (math.isinf(x) or math.isnan(x))):
+        return "N/A"
+    return f"${x:,.2f}"
+
+
+def pct(x: float) -> str:
+    if x is None or (isinstance(x, float) and (math.isinf(x) or math.isnan(x))):
+        return "N/A"
+    return f"{100 * x:.3f}%"
+
+
+def safe_mkdir_for_file(path: str) -> None:
+    folder = os.path.dirname(os.path.abspath(path))
+    if folder and not os.path.exists(folder):
+        os.makedirs(folder, exist_ok=True)
+
+
+def deep_merge(base: Dict[str, object], override: Dict[str, object]) -> Dict[str, object]:
+    """Recursively merge override into base."""
+    out = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)  # type: ignore
+        else:
+            out[k] = v
+    return out
+
+
+def load_config(path: str) -> Dict[str, object]:
+    if not os.path.exists(path):
+        return dict(DEFAULT_CONFIG)
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    return deep_merge(DEFAULT_CONFIG, raw)
+
+
+def save_config(path: str, cfg: Dict[str, object]) -> None:
+    safe_mkdir_for_file(path)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+
+# ---------------------------
+# Core finance math
+# ---------------------------
+def monthly_payment(principal: float, annual_rate: float, term_years: int) -> float:
+    if principal <= 0:
+        return 0.0
+    n = term_years * 12
+    r = annual_rate / 12.0
+    if abs(r) < 1e-12:
+        return principal / n
+    return principal * (r * (1 + r) ** n) / ((1 + r) ** n - 1)
+
+
+def total_interest_full_term(principal: float, annual_rate: float, term_years: int) -> float:
+    pmt = monthly_payment(principal, annual_rate, term_years)
+    return pmt * term_years * 12 - principal
+
+
+def down_bracket(down_pct: float) -> str:
+    if down_pct >= 0.10:
+        return "10_plus"
+    if down_pct >= 0.05:
+        return "5_10"
+    return "none"
+
+
+def va_fee_rate_from_cfg(cfg: Dict[str, object], down_pct: float) -> float:
+    va = cfg.get("va", {}) if isinstance(cfg.get("va"), dict) else {}
+    if not va.get("enabled", True):
+        return 0.0
+
+    override = va.get("funding_fee_override", None)
+    if override is not None:
+        return float(override)
+
+    vt = str(va.get("veteran_type", "active")).lower()
+    vt = vt if vt in VA_FUNDING_FEE_TABLE else "active"
+
+    first_use = bool(va.get("first_use", True))
+    use_key = "first_use" if first_use else "subsequent_use"
+
+    bracket = down_bracket(down_pct)
+    return float(VA_FUNDING_FEE_TABLE[vt][use_key][bracket])
+
+
+def compute_va_loan_amount(price: float, down_pct: float, fee_rate: float, finance_fee: bool) -> Tuple[float, float, float]:
+    """Returns (base_loan, funding_fee_amt, total_loan)."""
+    down_amt = price * down_pct
+    base_loan = max(0.0, price - down_amt)
+    fee_amt = base_loan * fee_rate
+    total_loan = base_loan + fee_amt if finance_fee else base_loan
+    return base_loan, fee_amt, total_loan
+
+
+def monthly_tax(home_price: float, tax_rate_annual: float) -> float:
+    return (home_price * tax_rate_annual) / 12.0
+
+
+def monthly_insurance(insurance_annual: float) -> float:
+    return insurance_annual / 12.0
+
+
+def purchase_scenario(cfg: Dict[str, object], price: float, down_pct: float, rate: float, term_years: int) -> Dict[str, float]:
+    tax_rate = float(cfg["property_tax_rate_annual"])
+    ins_annual = float(cfg["homeowners_insurance_annual"])
+    hoa = float(cfg["hoa_monthly"])
+
+    va = cfg.get("va", {}) if isinstance(cfg.get("va"), dict) else {}
+    is_va = bool(va.get("enabled", True))
+    finance_fee = bool(va.get("finance_funding_fee", True))
+
+    if is_va:
+        fee_rate = va_fee_rate_from_cfg(cfg, down_pct)
+        base_loan, fee_amt, loan = compute_va_loan_amount(price, down_pct, fee_rate, finance_fee)
+        pmi = 0.0  # VA: typically no PMI
+    else:
+        base_loan = max(0.0, price - price * down_pct)
+        fee_rate = 0.0
+        fee_amt = 0.0
+        loan = base_loan
+        pmi = 0.0  # if you later want non-VA PMI, add it here
+
+    pi = monthly_payment(loan, rate, term_years)
+    tax = monthly_tax(price, tax_rate)
+    ins = monthly_insurance(ins_annual)
+    piti = pi + tax + ins + hoa + pmi
+
+    return {
+        "price": price,
+        "down_pct": down_pct,
+        "loan_amount": loan,
+        "base_loan": base_loan,
+        "va_fee_rate": fee_rate,
+        "va_fee_amt": fee_amt,
+        "va_fee_financed": 1.0 if (is_va and finance_fee) else 0.0,
+        "annual_rate": rate,
+        "term_years": float(term_years),
+        "monthly_PI": pi,
+        "monthly_tax": tax,
+        "monthly_insurance": ins,
+        "monthly_HOA": hoa,
+        "monthly_PMI": pmi,
+        "monthly_PITI": piti,
+        "total_interest_full_term": total_interest_full_term(loan, rate, term_years),
+    }
+
+
+def debts_monthly_from_cfg(cfg: Dict[str, object]) -> float:
+    debts = cfg.get("debts", [])
+    if not isinstance(debts, list):
+        return 0.0
+
+    total = 0.0
+    for d in debts:
+        if not isinstance(d, dict):
+            continue
+        if "monthly_payment" in d and d["monthly_payment"] is not None:
+            total += float(d["monthly_payment"])
+            continue
+        # Otherwise estimate
+        bal = float(d.get("balance", 0.0))
+        apr_pct = float(d.get("apr_percent", 0.0))
+        yrs = float(d.get("remaining_years", 0.0))
+        if bal > 0 and apr_pct >= 0 and yrs > 0:
+            total += monthly_payment(bal, (apr_pct / 100.0), int(round(yrs)))
+    return total
+
+
+def affordability_metrics(cfg: Dict[str, object], monthly_piti: float, other_debts_monthly: float) -> Dict[str, float]:
+    income = float(cfg["gross_income_annual"])
+    gross_monthly = income / 12.0
+    housing_ratio = monthly_piti / gross_monthly if gross_monthly else float("inf")
+    dti_ratio = (monthly_piti + other_debts_monthly) / gross_monthly if gross_monthly else float("inf")
+
+    max_housing = float(cfg["max_housing_ratio"])
+    max_dti = float(cfg["max_dti_ratio"])
+
+    return {
+        "gross_monthly_income": gross_monthly,
+        "other_debts_monthly": other_debts_monthly,
+        "housing_ratio": housing_ratio,
+        "dti_ratio": dti_ratio,
+        "passes_housing_ratio": 1.0 if housing_ratio <= max_housing else 0.0,
+        "passes_dti_ratio": 1.0 if dti_ratio <= max_dti else 0.0,
+    }
+
+
+def refinance(balance: float, current_rate: float, remaining_years: int, new_rate: float, new_term_years: int,
+              closing_costs: float, roll_costs: bool) -> Dict[str, float]:
+    current_pmt = monthly_payment(balance, current_rate, remaining_years)
+    new_principal = balance + closing_costs if roll_costs else balance
+    new_pmt = monthly_payment(new_principal, new_rate, new_term_years)
+
+    savings = current_pmt - new_pmt
+    breakeven = (closing_costs / savings) if savings > 0 else float("inf")
+
+    return {
+        "balance": balance,
+        "current_rate": current_rate,
+        "remaining_years": float(remaining_years),
+        "current_monthly_PI": current_pmt,
+        "new_rate": new_rate,
+        "new_term_years": float(new_term_years),
+        "closing_costs": closing_costs,
+        "roll_costs": 1.0 if roll_costs else 0.0,
+        "new_principal": new_principal,
+        "new_monthly_PI": new_pmt,
+        "monthly_savings_PI": savings,
+        "breakeven_months": breakeven,
+    }
+
+
+# ---------------------------
+# Output
+# ---------------------------
+def print_purchase(res: Dict[str, float]) -> None:
+    print("\n--- Purchase / Payment ---")
+    print(f"Home price:            {money(res['price'])}")
+    print(f"Down %:                {pct(res['down_pct'])}")
+    print(f"Loan amount:           {money(res['loan_amount'])}")
+    if res["va_fee_rate"] > 0:
+        print(f"VA funding fee rate:   {pct(res['va_fee_rate'])}")
+        print(f"VA funding fee amount: {money(res['va_fee_amt'])}")
+        print(f"VA fee financed?:      {'YES' if res['va_fee_financed'] == 1.0 else 'NO'}")
+    print(f"Rate / term:           {pct(res['annual_rate'])} / {int(res['term_years'])} years")
+    print("")
+    print(f"Monthly P&I:           {money(res['monthly_PI'])}")
+    print(f"Property tax:          {money(res['monthly_tax'])}")
+    print(f"Insurance:             {money(res['monthly_insurance'])}")
+    print(f"HOA:                   {money(res['monthly_HOA'])}")
+    print(f"PMI:                   {money(res['monthly_PMI'])}")
+    print(f"Monthly PITI:          {money(res['monthly_PITI'])}")
+    print(f"Total interest (term): {money(res['total_interest_full_term'])}")
+
+
+def print_affordability(m: Dict[str, float], cfg: Dict[str, object]) -> None:
+    print("\n--- Affordability ---")
+    print(f"Gross monthly income:  {money(m['gross_monthly_income'])}")
+    print(f"Other debts monthly:   {money(m['other_debts_monthly'])}")
+    print(f"Housing ratio:         {pct(m['housing_ratio'])} (limit {pct(float(cfg['max_housing_ratio']))})")
+    print(f"DTI ratio:             {pct(m['dti_ratio'])} (limit {pct(float(cfg['max_dti_ratio']))})")
+    print(f"Pass housing ratio?:   {'YES' if m['passes_housing_ratio'] == 1.0 else 'NO'}")
+    print(f"Pass DTI ratio?:       {'YES' if m['passes_dti_ratio'] == 1.0 else 'NO'}")
+
+
+def write_csv(path: str, rows: List[Dict[str, float]]) -> None:
+    """Write rows to CSV with proper error handling and validation."""
+    if not rows:
+        raise ValueError("No rows to write.")
+    
+    # Ensure directory exists
+    safe_mkdir_for_file(path)
+    
+    # Get all unique keys from all rows (in case some rows have different keys)
+    all_keys = []
+    seen = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                all_keys.append(key)
+                seen.add(key)
+    
+    # Write CSV
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=all_keys, extrasaction='ignore')
+        w.writeheader()
+        w.writerows(rows)
+    
+    # Validate file was written
+    if not os.path.exists(path):
+        raise IOError(f"CSV file was not created: {path}")
+    
+    # Validate file has content
+    if os.path.getsize(path) == 0:
+        raise IOError(f"CSV file is empty: {path}")
+
+
+# ---------------------------
+# Interactive calculator
+# ---------------------------
+def interactive(cfg_path: str) -> None:
+    cfg = load_config(cfg_path)
+    
+    # Show file locations
+    cwd = os.getcwd()
+    cfg_full_path = os.path.abspath(cfg_path)
+    
+    print(f"\n{'='*60}")
+    print(f"VA Mortgage Calculator")
+    print(f"{'='*60}")
+    print(f"Working directory: {cwd}")
+    print(f"Config file: {cfg_full_path}")
+    if not os.path.exists(cfg_full_path):
+        print(f"  (will be created when you save)")
+    print(f"CSV files will save to: {cwd}")
+    print(f"{'='*60}\n")
+
+    while True:
+        print("\nMenu:")
+        print("  1) Purchase / Payment (PITI)")
+        print("  2) Affordability (DTI + housing ratio)")
+        print("  3) Refinance")
+        print("  4) Sensitivity grid -> CSV")
+        print("  5) Save current defaults back to config.json")
+        print("  0) Exit")
+        choice = input("Select: ").strip()
+
+        if choice == "0":
+            return
+
+        if choice == "5":
+            try:
+                save_config(cfg_path, cfg)
+                saved_path = os.path.abspath(cfg_path)
+                print(f"\n✓ Successfully saved to: {saved_path}")
+                
+                # Verify file was created
+                if os.path.exists(saved_path):
+                    file_size = os.path.getsize(saved_path)
+                    print(f"  File size: {file_size} bytes")
+                else:
+                    print(f"  ⚠ Warning: File may not have been saved properly")
+            except Exception as e:
+                print(f"\n✗ Error saving config: {e}")
+            continue
+
+        if choice == "1":
+            print("\n--- Purchase / Payment (PITI) ---")
+            price = float(input("Home price ($): ").strip())
+            
+            # Check if VA loan
+            is_va = isinstance(cfg.get("va"), dict) and cfg["va"].get("enabled", True)
+            if is_va:
+                print("VA loan enabled (configured in settings)")
+                down_pct = 0.0
+            else:
+                down_pct = float(input("Down payment % as decimal (e.g., 0.20): ").strip())
+            
+            rate = float(input(f"Rate decimal [{cfg['default_rate']}]: ").strip() or cfg["default_rate"])
+            term = int(input(f"Term years [{cfg['term_years']}]: ").strip() or cfg["term_years"])
+            
+            # Allow overriding config values for this calculation
+            print(f"\nCurrent settings (press Enter to keep, or enter new value):")
+            
+            tax_input = input(f"Property tax rate annual [{cfg['property_tax_rate_annual']}]: ").strip()
+            if tax_input:
+                cfg["property_tax_rate_annual"] = float(tax_input)
+            
+            ins_input = input(f"Homeowners insurance annual ($) [{cfg['homeowners_insurance_annual']}]: ").strip()
+            if ins_input:
+                cfg["homeowners_insurance_annual"] = float(ins_input)
+            
+            hoa_input = input(f"HOA monthly ($) [{cfg['hoa_monthly']}]: ").strip()
+            if hoa_input:
+                cfg["hoa_monthly"] = float(hoa_input)
+
+            res = purchase_scenario(cfg, price=price, down_pct=down_pct, rate=rate, term_years=term)
+            print_purchase(res)
+
+        elif choice == "2":
+            print("\n--- Affordability Check ---")
+            price = float(input("Home price ($): ").strip())
+            
+            # Check if VA loan
+            is_va = isinstance(cfg.get("va"), dict) and cfg["va"].get("enabled", True)
+            if is_va:
+                print("VA loan enabled (configured in settings)")
+                down_pct = 0.0
+            else:
+                down_pct = float(input("Down payment % as decimal (e.g., 0.20): ").strip())
+            
+            rate = float(input(f"Rate decimal [{cfg['default_rate']}]: ").strip() or cfg["default_rate"])
+            term = int(input(f"Term years [{cfg['term_years']}]: ").strip() or cfg["term_years"])
+            
+            # Allow overriding config values
+            print(f"\nCurrent settings (press Enter to keep, or enter new value):")
+            
+            tax_input = input(f"Property tax rate annual [{cfg['property_tax_rate_annual']}]: ").strip()
+            if tax_input:
+                cfg["property_tax_rate_annual"] = float(tax_input)
+            
+            ins_input = input(f"Homeowners insurance annual ($) [{cfg['homeowners_insurance_annual']}]: ").strip()
+            if ins_input:
+                cfg["homeowners_insurance_annual"] = float(ins_input)
+            
+            hoa_input = input(f"HOA monthly ($) [{cfg['hoa_monthly']}]: ").strip()
+            if hoa_input:
+                cfg["hoa_monthly"] = float(hoa_input)
+
+            res = purchase_scenario(cfg, price=price, down_pct=down_pct, rate=rate, term_years=term)
+            print_purchase(res)
+
+            other_debts = debts_monthly_from_cfg(cfg)
+            m = affordability_metrics(cfg, monthly_piti=res["monthly_PITI"], other_debts_monthly=other_debts)
+            print_affordability(m, cfg)
+
+        elif choice == "3":
+            bal = float(input("Current balance ($): ").strip())
+            cur_rate = float(input("Current rate decimal: ").strip())
+            rem_years = int(input("Remaining years: ").strip())
+            new_rate = float(input("New rate decimal: ").strip())
+            new_term = int(input("New term years [30]: ").strip() or "30")
+            closing = float(input("Closing costs ($) [6000]: ").strip() or "6000")
+            roll = (input("Roll closing costs into new loan? (y/N): ").strip().lower() in {"y", "yes"})
+
+            r = refinance(bal, cur_rate, rem_years, new_rate, new_term, closing, roll)
+            print("\n--- Refinance ---")
+            print(f"Current monthly P&I: {money(r['current_monthly_PI'])}")
+            print(f"New monthly P&I:     {money(r['new_monthly_PI'])}")
+            print(f"Monthly savings:     {money(r['monthly_savings_PI'])}")
+            if math.isinf(r["breakeven_months"]):
+                print("Breakeven months:    N/A (no savings)")
+            else:
+                print(f"Breakeven months:    {r['breakeven_months']:.1f}")
+
+        elif choice == "4":
+            grid = cfg.get("grid_defaults", {}) if isinstance(cfg.get("grid_defaults"), dict) else {}
+            prices = grid.get("prices", [250000, 300000, 350000, 400000])
+            rates = grid.get("rates", [0.055, float(cfg["default_rate"]), 0.062])
+            down_pcts = grid.get("down_pcts", [0.0])
+            out = str(grid.get("out", "grid.csv"))
+
+            print(f"\nGrid settings:")
+            print(f"  Prices: {prices}")
+            print(f"  Rates: {rates}")
+            print(f"  Down payments: {down_pcts}")
+            print(f"  Output file: {out}")
+            
+            term = int(input(f"\nTerm years [{cfg['term_years']}]: ").strip() or cfg["term_years"])
+
+            try:
+                other_debts = debts_monthly_from_cfg(cfg)
+                rows: List[Dict[str, float]] = []
+                
+                print(f"\nGenerating {len(list(product(prices, rates, down_pcts)))} scenarios...")
+                
+                for price, rate, dp in product(prices, rates, down_pcts):
+                    base = purchase_scenario(cfg, price=float(price), down_pct=float(dp), rate=float(rate), term_years=term)
+                    m = affordability_metrics(cfg, monthly_piti=base["monthly_PITI"], other_debts_monthly=other_debts)
+                    rows.append({**base, **m})
+
+                write_csv(out, rows)
+                saved_path = os.path.abspath(out)
+                
+                print(f"\n✓ Successfully created CSV!")
+                print(f"  File: {saved_path}")
+                print(f"  Rows: {len(rows)} scenarios")
+                print(f"  Columns: {len(rows[0])} data fields")
+                
+                # Verify file was created
+                if os.path.exists(saved_path):
+                    file_size = os.path.getsize(saved_path)
+                    print(f"  Size: {file_size:,} bytes")
+                else:
+                    print(f"  ⚠ Warning: File may not have been saved properly")
+                    
+            except Exception as e:
+                print(f"\n✗ Error creating CSV: {e}")
+                import traceback
+                traceback.print_exc()
+
+        else:
+            print("Invalid choice.")
+
+
+# ---------------------------
+# CLI commands
+# ---------------------------
+def cmd_init(cfg_path: str) -> None:
+    """Initialize a config.json file with default values."""
+    if os.path.exists(cfg_path):
+        print(f"✓ {cfg_path} already exists. Not overwriting.")
+        print(f"  To reset, delete the file and run 'init' again.")
+        return
+    
+    try:
+        save_config(cfg_path, dict(DEFAULT_CONFIG))
+        saved_path = os.path.abspath(cfg_path)
+        print(f"✓ Created {saved_path}")
+        print(f"  Edit this file to customize your defaults, then run the calculator.")
+        
+        # Verify
+        if os.path.exists(saved_path):
+            file_size = os.path.getsize(saved_path)
+            print(f"  File size: {file_size} bytes")
+    except Exception as e:
+        print(f"✗ Error creating config: {e}")
+
+
+def cmd_grid(cfg_path: str, out: str, prices: List[float], rates: List[float], down_pcts: List[float], term: int) -> None:
+    """Generate sensitivity grid CSV from command line."""
+    try:
+        cfg = load_config(cfg_path)
+        other_debts = debts_monthly_from_cfg(cfg)
+        rows: List[Dict[str, float]] = []
+        
+        print(f"Generating grid with {len(list(product(prices, rates, down_pcts)))} scenarios...")
+        
+        for price, rate, dp in product(prices, rates, down_pcts):
+            base = purchase_scenario(cfg, price=price, down_pct=dp, rate=rate, term_years=term)
+            m = affordability_metrics(cfg, monthly_piti=base["monthly_PITI"], other_debts_monthly=other_debts)
+            rows.append({**base, **m})
+        
+        write_csv(out, rows)
+        saved_path = os.path.abspath(out)
+        
+        print(f"✓ Successfully created {saved_path}")
+        print(f"  Rows: {len(rows)}")
+        print(f"  Size: {os.path.getsize(saved_path):,} bytes")
+        
+    except Exception as e:
+        print(f"✗ Error: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def main() -> None:
+    # Check if running in Jupyter/IPython
+    try:
+        get_ipython()  # type: ignore
+        # Running in Jupyter - go straight to interactive mode
+        print("Running in Jupyter mode...")
+        interactive(CONFIG_FILE_DEFAULT)
+        return
+    except NameError:
+        pass  # Not in Jupyter, continue with argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default=CONFIG_FILE_DEFAULT, help="Path to config.json")
+
+    sub = parser.add_subparsers(dest="cmd")
+
+    sub.add_parser("init", help="Create a starter config.json (if missing).")
+
+    g = sub.add_parser("grid", help="Write sensitivity grid CSV (includes affordability columns).")
+    g.add_argument("--out", type=str, default="grid.csv")
+    g.add_argument("--prices", type=float, nargs="+", default=[250000, 300000, 350000, 400000])
+    g.add_argument("--rates", type=float, nargs="+", default=[0.055, 0.0588, 0.062])
+    g.add_argument("--down_pcts", type=float, nargs="+", default=[0.0])
+    g.add_argument("--term", type=int, default=30)
+
+    args = parser.parse_args()
+    cfg_path = args.config
+
+    if args.cmd == "init":
+        cmd_init(cfg_path)
+        return
+
+    if args.cmd == "grid":
+        cmd_grid(cfg_path, args.out, args.prices, args.rates, args.down_pcts, args.term)
+        return
+
+    # No subcommand => interactive calculator
+    interactive(cfg_path)
+
+
+if __name__ == "__main__":
+    main()
+
+
+# In[ ]:
+
+
+
+
